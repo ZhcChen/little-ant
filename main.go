@@ -2,6 +2,10 @@ package main
 
 import "github.com/gin-gonic/gin"
 
+func init() {
+	MonitorComputerResources()
+}
+
 func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
