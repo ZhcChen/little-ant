@@ -11,8 +11,11 @@ import (
 	"github.com/shirou/gopsutil/net"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 )
+
+const PingTimeout = 10
 
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -22,14 +25,15 @@ var wsUpgrader = websocket.Upgrader{
 	},
 }
 var wsConnMap = make(map[string]*websocket.Conn)
-var kkk = ""
-var computerResources *ComputerResources = &ComputerResources{
+var wsRecordMap = make(map[string]*WsRecord)
+var computerResources = &ComputerResources{
 	Cpu:             0,
 	Memory:          0,
 	Disk:            0,
 	DiskSpeed:       map[string]DiskSpeed{},
 	NetworkUpload:   0,
 	NetworkDownload: 0,
+	Ip:              "",
 }
 
 func Ping(c *gin.Context) {
@@ -43,33 +47,77 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := ""
 	if conn != nil {
-		kkk = r.Header.Get("Sec-Websocket-Key")
-		wsConnMap[kkk] = conn
+		key = r.Header.Get("Sec-Websocket-Key")
+		wsConnMap[key] = conn
+		wsRecordMap[key] = &WsRecord{
+			Timestamp: time.Now().Unix(),
+			AutoSend:  true,
+			Key:       key,
+		}
 	}
 
+	// 推机器监控数据
 	go func() {
+		_conn := wsConnMap[key]
+		wsRecord := wsRecordMap[key]
+
+		defer _conn.Close()
+
 		for {
-			time.Sleep(time.Second * 1)
-			_conn := wsConnMap[kkk]
 			if _conn != nil {
-				computerResourcesJson, err := json.Marshal(computerResources)
-				if err != nil {
+				// 移除超时的长链接
+				if (wsRecord.Timestamp + PingTimeout) < time.Now().Unix() {
+					delete(wsConnMap, key)
+					break
+				}
+				wsMessage := WsMessage[ComputerResources]{
+					Data: *computerResources,
+					Type: 1,
+				}
+				wsMessageJson, wsMessageErr := json.Marshal(wsMessage)
+				if wsMessageErr != nil {
 					continue
 				}
-				_conn.WriteMessage(1, computerResourcesJson)
+				connWriteMessage := _conn.WriteMessage(1, wsMessageJson)
+				if connWriteMessage != nil {
+					log.Println("推机器监控数据异常：", connWriteMessage)
+				}
+			} else {
+				break
 			}
+			time.Sleep(time.Second)
 		}
 	}()
 
+	// 消息接收
 	for {
 		t, msg, readMessageErr := conn.ReadMessage()
 		if readMessageErr != nil {
 			break
 		}
-		writeMessageErr := conn.WriteMessage(t, msg)
-		if writeMessageErr != nil {
-			return
+		var data WsMessage[any]
+		if json.Unmarshal(msg, &data) != nil {
+			continue
+		}
+		// 心跳包
+		if data.Type == 0 && data.Data.(string) == "ping" {
+			ackMsg := WsMessage[string]{
+				Data: "pong",
+				Type: 0,
+			}
+			ackMsgBytes, ackMsgBytesErr := json.Marshal(ackMsg)
+			if ackMsgBytesErr != nil {
+				log.Println("心跳包数据json异常：", ackMsgBytesErr)
+				continue
+			}
+			writeMessageErr := conn.WriteMessage(t, ackMsgBytes)
+			if writeMessageErr != nil {
+				log.Println("心跳包响应推送异常：", writeMessageErr)
+				continue
+			}
+			wsRecordMap[key].Timestamp = time.Now().Unix()
 		}
 	}
 }
@@ -82,11 +130,7 @@ func Ws(c *gin.Context) {
 // MonitorComputerResources 这里监控计算机本身资源
 func MonitorComputerResources() {
 	go func() {
-		log.Println("开始监控")
-
 		for {
-			time.Sleep(time.Second * 1)
-
 			// 获取CPU使用率
 			cpuPercent, _ := cpu.Percent(0, false)
 			computerResources.Cpu = cpuPercent[0]
@@ -111,6 +155,11 @@ func MonitorComputerResources() {
 			computerResources.NetworkDownload = netInfo[0].BytesRecv
 			fmt.Printf("Network Upload: %d bytes\n", netInfo[0].BytesSent)
 			fmt.Printf("Network Download: %d bytes\n", netInfo[0].BytesRecv)
+
+			// 获取IP
+			GetRealIp()
+
+			time.Sleep(time.Second * 1)
 		}
 	}()
 }
@@ -148,4 +197,26 @@ func DiskIoRwSpeed() {
 			WriteSpeed: v.WriteBytes - before[k].WriteBytes,
 		}
 	}
+}
+
+func GetRealIp() string {
+	log.Println("start ip ===============================")
+	// 获取所有网络接口
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		fmt.Println("Error getting network interfaces:", err)
+		return ""
+	}
+
+	log.Println("network interfaces len: ", strconv.Itoa(len(interfaces)))
+
+	// 遍历每个网络接口
+	for _, iface := range interfaces {
+		// 遍历每个地址
+		for _, addr := range iface.Addrs {
+			log.Println("addr: ", addr.Addr)
+		}
+	}
+
+	return "127.0.0.1"
 }
